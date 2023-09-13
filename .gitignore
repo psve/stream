@@ -1,0 +1,7 @@
+# Binaries
+stream.test
+
+# Generated files
+cpu.prof
+mem.prof
+coverage.out

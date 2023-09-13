@@ -1,0 +1,54 @@
+# This is a taskfile for the Task tool. See https://taskfile.dev for install instructions.
+
+version: '3'
+
+tasks:
+  test:
+    desc: Run all tests.
+    cmds:
+      - go test -v -count=1 ./...
+
+  bench:
+    desc: Run all benchmarks.
+    cmds:
+      - go test -v -run="Benchmark*" -benchmem -bench .
+
+  profile:
+    desc: Generate CPU and memory profiles.
+    cmds:
+      - go test -v -cpuprofile cpu.prof -memprofile mem.prof -run="Benchmark*" -benchmem -bench .
+
+  pprof-cpu:
+    desc: Show CPU profile.
+    deps: [profile]
+    cmds:
+      - go tool pprof -http=localhost:8001 ./stream.test cpu.prof
+
+  pprof-mem:
+    desc: Show memory profile.
+    deps: [profile]
+    cmds:
+      - go tool pprof -http=localhost:8001 ./stream.test mem.prof
+
+  coverage:
+    dsec: Generate coverage report.
+    cmds:
+      - go test -v -count=1 -coverprofile=coverage.out ./...
+
+  show-coverage:
+    desc: Show coverage report.
+    deps: [coverage]
+    cmds:
+      - go tool cover -html=coverage.out
+
+  lint:
+    desc: Run linter checks.
+    cmds:
+      - golangci-lint run --config ./golangci-lint.toml ./...
+
+  clean:
+    desc: Remove build/runtime artifacts
+    cmds:
+      - rm -f ./cpu.prof
+      - rm -f ./mem.prof
+      - rm -f ./coverage.out

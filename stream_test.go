@@ -714,8 +714,8 @@ func BenchmarkReader(b *testing.B) {
 
 	ciphertext := new(bytes.Buffer)
 	sr := must(stream.NewWriter(ciphertext, nil))
-	sr.Write(plaintext)
-	sr.Close()
+	_, _ = sr.Write(plaintext)
+	_ = sr.Close()
 
 	buf := make([]byte, len(plaintext))
 

@@ -41,9 +41,11 @@ const (
 	counterOverhead = 4
 )
 
-var ErrModifiedStream = errors.New("modified stream")
-var ErrTruncatedStream = errors.New("truncated stream")
-var ErrWriteAfterClose = errors.New("write after close")
+var (
+	ErrModifiedStream  = errors.New("modified stream")
+	ErrTruncatedStream = errors.New("truncated stream")
+	ErrWriteAfterClose = errors.New("write after close")
+)
 
 type data struct {
 	chunk []byte
