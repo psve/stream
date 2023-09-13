@@ -45,6 +45,11 @@ var ErrModifiedStream = errors.New("modified stream")
 var ErrTruncatedStream = errors.New("truncated stream")
 var ErrWriteAfterClose = errors.New("write after close")
 
+type data struct {
+	chunk []byte
+	nonce []byte
+}
+
 // STREAM is a cipher mode providing "online authenticated encryption" also known as
 // chunked or streaming authenticated encryption. It provides two ways of doing
 // streaming encryption:
@@ -55,10 +60,9 @@ type STREAM struct {
 	// aead is the underlying AEAD construction.
 	aead cipher.AEAD
 
-	// These pools help amortize buffer allocations when the same STREAM instance is used
+	// This pools help amortize buffer allocations when the same STREAM instance is used
 	// multiple times.
-	noncePool *sync.Pool
-	chunkPool *sync.Pool
+	dataPool *sync.Pool
 }
 
 // NewSTREAM creates a new STREAM instance which uses the provided AEAD internally to
@@ -71,13 +75,12 @@ type STREAM struct {
 func NewSTREAM(aead cipher.AEAD) *STREAM {
 	return &STREAM{
 		aead: aead,
-		noncePool: &sync.Pool{New: func() any {
-			nonce := make([]byte, aead.NonceSize())
-			return &nonce
-		}},
-		chunkPool: &sync.Pool{New: func() any {
-			chunk := make([]byte, ChunkSize+aead.Overhead())
-			return &chunk
+		dataPool: &sync.Pool{New: func() any {
+			r := &data{
+				chunk: make([]byte, ChunkSize+aead.Overhead()),
+				nonce: make([]byte, aead.NonceSize()),
+			}
+			return r
 		}},
 	}
 }
@@ -130,29 +133,25 @@ func (s *STREAM) Overhead(bytes int) int {
 // STREAMWriter is a wrapper which will encrypt data to an underlying io.Writer.
 // It implements io.WriteCloser and io.ReaderFrom.
 type STREAMWriter struct {
-	w         io.Writer
-	aead      cipher.AEAD
-	noncePool *sync.Pool
-	chunkPool *sync.Pool
-	chunk     []byte
-	nonce     []byte
-	ad        []byte
-	closed    bool
+	w        io.Writer
+	aead     cipher.AEAD
+	dataPool *sync.Pool
+	d        *data
+	ad       []byte
+	closed   bool
 }
 
 // NewWriter returns a new STREAMWriter which wraps w.
 func (s *STREAM) NewWriter(w io.Writer, additionalData []byte) (*STREAMWriter, error) {
 	sw := &STREAMWriter{
-		w:         w,
-		aead:      s.aead,
-		noncePool: s.noncePool,
-		chunkPool: s.chunkPool,
-		chunk:     *(s.chunkPool.Get().(*[]byte)),
-		nonce:     *(s.noncePool.Get().(*[]byte)),
-		ad:        additionalData,
+		w:        w,
+		aead:     s.aead,
+		dataPool: s.dataPool,
+		d:        (s.dataPool.Get().(*data)),
+		ad:       additionalData,
 	}
-	sw.chunk = sw.chunk[:0]
-	if _, err := rand.Read(sw.nonce[counterOverhead:]); err != nil {
+	sw.d.chunk = sw.d.chunk[:0]
+	if _, err := rand.Read(sw.d.nonce[counterOverhead:]); err != nil {
 		return nil, fmt.Errorf("could not generate nonce: %w", err)
 	}
 	return sw, nil
@@ -169,35 +168,35 @@ func (sw *STREAMWriter) Write(p []byte) (int, error) {
 
 	for idx := 0; idx < len(p); {
 		switch {
-		case len(sw.chunk) == 0 && len(p[idx:]) >= ChunkSize:
+		case len(sw.d.chunk) == 0 && len(p[idx:]) >= ChunkSize:
 			// If there's nothing in our buffer, and we could buffer an entire chunk, just use
 			// p as input directly.
-			if _, err := sw.w.Write(sw.nonce); err != nil {
+			if _, err := sw.w.Write(sw.d.nonce); err != nil {
 				return idx, fmt.Errorf("could not write nonce: %w", err)
 			}
-			if _, err := sw.w.Write(sw.aead.Seal(sw.chunk[:0], sw.nonce, p[idx:idx+ChunkSize], sw.ad)); err != nil {
+			if _, err := sw.w.Write(sw.aead.Seal(sw.d.chunk[:0], sw.d.nonce, p[idx:idx+ChunkSize], sw.ad)); err != nil {
 				return idx, fmt.Errorf("could not write chunk: %w", err)
 			}
 
-			sw.ad, sw.chunk = nil, sw.chunk[:0]
+			sw.ad, sw.d.chunk = nil, sw.d.chunk[:0]
 			sw.increaseCounter()
 			idx += ChunkSize
-		case len(sw.chunk) < ChunkSize:
+		case len(sw.d.chunk) < ChunkSize:
 			// If we don't have a full chunk buffer yet, buffer as much as possible. Note that
 			// the buffer always has capacity ChunkSize, so this doesn't allocate.
-			canBuffer := min(len(p)-idx, ChunkSize-len(sw.chunk))
-			sw.chunk = append(sw.chunk, p[idx:idx+canBuffer]...)
+			canBuffer := min(len(p)-idx, ChunkSize-len(sw.d.chunk))
+			sw.d.chunk = append(sw.d.chunk, p[idx:idx+canBuffer]...)
 			idx += canBuffer
-		case len(sw.chunk) == ChunkSize:
+		case len(sw.d.chunk) == ChunkSize:
 			// We have filled up our plaintext buffer, write the next chunk.
-			if _, err := sw.w.Write(sw.nonce); err != nil {
+			if _, err := sw.w.Write(sw.d.nonce); err != nil {
 				return idx, fmt.Errorf("could not write nonce: %w", err)
 			}
-			if _, err := sw.w.Write(sw.aead.Seal(sw.chunk[:0], sw.nonce, sw.chunk, sw.ad)); err != nil {
+			if _, err := sw.w.Write(sw.aead.Seal(sw.d.chunk[:0], sw.d.nonce, sw.d.chunk, sw.ad)); err != nil {
 				return idx, fmt.Errorf("could not write chunk: %w", err)
 			}
 
-			sw.ad, sw.chunk = nil, sw.chunk[:0]
+			sw.ad, sw.d.chunk = nil, sw.d.chunk[:0]
 			sw.increaseCounter()
 			idx += ChunkSize
 		}
@@ -214,18 +213,16 @@ func (sw *STREAMWriter) Close() error {
 	}
 
 	// Indicate that this is the last chunk and write it.
-	sw.nonce[0] = 1
-	if _, err := sw.w.Write(sw.nonce); err != nil {
+	sw.d.nonce[0] = 1
+	if _, err := sw.w.Write(sw.d.nonce); err != nil {
 		return fmt.Errorf("could not write nonce: %w", err)
 	}
-	if _, err := sw.w.Write(sw.aead.Seal(sw.chunk[:0], sw.nonce, sw.chunk, sw.ad)); err != nil {
+	if _, err := sw.w.Write(sw.aead.Seal(sw.d.chunk[:0], sw.d.nonce, sw.d.chunk, sw.ad)); err != nil {
 		return fmt.Errorf("could not write chunk: %w", err)
 	}
 
-	clear(sw.nonce[:counterOverhead])
-	sw.chunk = sw.chunk[:cap(sw.chunk)]
-	sw.noncePool.Put(&sw.nonce)
-	sw.chunkPool.Put(&sw.chunk)
+	clear(sw.d.nonce[:counterOverhead])
+	sw.dataPool.Put(sw.d)
 	sw.ad = nil
 	sw.closed = true
 	return nil
@@ -239,41 +236,39 @@ func (sw *STREAMWriter) ReadFrom(r io.Reader) (int64, error) {
 	}
 
 	read := int64(0)
-	for ; sw.nonce[0] != 1; sw.increaseCounter() {
-		n, err := io.ReadFull(r, sw.chunk[:ChunkSize])
+	for ; sw.d.nonce[0] != 1; sw.increaseCounter() {
+		n, err := io.ReadFull(r, sw.d.chunk[:ChunkSize])
 		read += int64(n)
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 			// This is the last chunk
-			sw.nonce[0] = 1
+			sw.d.nonce[0] = 1
 		} else if err != nil {
 			return read, fmt.Errorf("could not read chunk: %w", err)
 		}
-		if _, err := sw.w.Write(sw.nonce); err != nil {
+		if _, err := sw.w.Write(sw.d.nonce); err != nil {
 			return read, fmt.Errorf("could not write nonce: %w", err)
 		}
-		if _, err := sw.w.Write(sw.aead.Seal(sw.chunk[:0], sw.nonce, sw.chunk[:n], sw.ad)); err != nil {
+		if _, err := sw.w.Write(sw.aead.Seal(sw.d.chunk[:0], sw.d.nonce, sw.d.chunk[:n], sw.ad)); err != nil {
 			return read, fmt.Errorf("could not write chunk: %w", err)
 		}
 		sw.ad = nil
 	}
 
-	clear(sw.nonce[:counterOverhead])
-	sw.chunk = sw.chunk[:cap(sw.chunk)]
-	sw.noncePool.Put(&sw.nonce)
-	sw.chunkPool.Put(&sw.chunk)
+	clear(sw.d.nonce[:counterOverhead])
+	sw.dataPool.Put(sw.d)
 	sw.closed = true
 	return read, nil
 }
 
 // increaseCounter increments the counter part of the header.
 func (sw *STREAMWriter) increaseCounter() {
-	if sw.nonce[1]++; sw.nonce[1] != 0 {
+	if sw.d.nonce[1]++; sw.d.nonce[1] != 0 {
 		return
 	}
-	if sw.nonce[2]++; sw.nonce[2] != 0 {
+	if sw.d.nonce[2]++; sw.d.nonce[2] != 0 {
 		return
 	}
-	sw.nonce[3]++
+	sw.d.nonce[3]++
 }
 
 // STREAMReader is a wrapper which will decrypt data from an underlying io.Reader. It
@@ -281,28 +276,26 @@ func (sw *STREAMWriter) increaseCounter() {
 type STREAMReader struct {
 	r          io.Reader
 	aead       cipher.AEAD
-	noncePool  *sync.Pool
-	chunkPool  *sync.Pool
-	chunk      []byte
+	dataPool   *sync.Pool
+	d          *data
 	chunkIdx   int
 	chunkCount int
-	nonce      []byte
 	ad         []byte
 	closed     bool
 }
 
 // NewReader returns a new STREAMReader which wraps r.
 func (s *STREAM) NewReader(r io.Reader, additionalData []byte) *STREAMReader {
-	return &STREAMReader{
-		r:         r,
-		aead:      s.aead,
-		noncePool: s.noncePool,
-		chunkPool: s.chunkPool,
-		chunk:     *(s.chunkPool.Get().(*[]byte)),
-		nonce:     *(s.noncePool.Get().(*[]byte)),
-		chunkIdx:  ChunkSize,
-		ad:        additionalData,
+	sr := &STREAMReader{
+		r:        r,
+		aead:     s.aead,
+		dataPool: s.dataPool,
+		d:        (s.dataPool.Get().(*data)),
+		chunkIdx: ChunkSize,
+		ad:       additionalData,
 	}
+	sr.d.chunk = sr.d.chunk[:cap(sr.d.chunk)]
+	return sr
 }
 
 // Read will decrypt data from the underlying io.Reader and write the result to p. Once
@@ -312,11 +305,11 @@ func (sr *STREAMReader) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 
-	out, inplace := sr.chunk, false
+	out, inplace := sr.d.chunk, false
 
 	for idx := 0; idx < len(p); {
 		switch {
-		case sr.nonce[0] == 1 && sr.chunkIdx == len(out):
+		case sr.d.nonce[0] == 1 && sr.chunkIdx == len(out):
 			// We have read the last chunk and used the entire plaintext buffer. There's
 			// nothing left to do.
 			return idx, io.EOF
@@ -333,7 +326,7 @@ func (sr *STREAMReader) Read(p []byte) (int, error) {
 		case sr.chunkIdx == ChunkSize:
 			// We havn't read the last chunk yet, but we have run out of plaintext buffer. Try
 			// to read the next chunk.
-			if _, err := io.ReadFull(sr.r, sr.nonce); err != nil {
+			if _, err := io.ReadFull(sr.r, sr.d.nonce); err != nil {
 				return idx, fmt.Errorf("could not read nonce: %w", err)
 			}
 			if sr.chunkCount != sr.getCounter() {
@@ -345,22 +338,22 @@ func (sr *STREAMReader) Read(p []byte) (int, error) {
 			if cap(p[idx:]) >= ChunkSize+sr.aead.Overhead() {
 				out, inplace = p[idx:], true
 			} else {
-				out, inplace = sr.chunk, false
-				defer func() { sr.chunk = out }()
+				out, inplace = sr.d.chunk, false
+				defer func() { sr.d.chunk = out }()
 			}
 
 			// Growing the slice here to make room for the ciphertext chunk doesn't require
 			// allocation:
-			// - sr.chunk always has capacity ChunkSize+sr.aead.Overhead().
+			// - sr.d.chunk always has capacity ChunkSize+sr.aead.Overhead().
 			// - In case of an inplace operation the check above ensures that p has enough
 			//   capacity.
 			out = out[:ChunkSize+sr.aead.Overhead()]
 
 			n, err := io.ReadFull(sr.r, out)
-			if sr.nonce[0] != 1 && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) {
+			if sr.d.nonce[0] != 1 && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) {
 				return idx, ErrTruncatedStream
 			}
-			out, err = sr.aead.Open(out[:0], sr.nonce, out[:n], sr.ad)
+			out, err = sr.aead.Open(out[:0], sr.d.nonce, out[:n], sr.ad)
 			if err != nil {
 				return idx, fmt.Errorf("decryption failed: %w", err)
 			}
@@ -380,10 +373,9 @@ func (sr *STREAMReader) Close() error {
 		return nil
 	}
 
-	clear(sr.nonce[:counterOverhead])
-	sr.chunk = sr.chunk[:cap(sr.chunk)]
-	sr.noncePool.Put(&sr.nonce)
-	sr.chunkPool.Put(&sr.chunk)
+	clear(sr.d.nonce[:counterOverhead])
+	sr.d.chunk = sr.d.chunk[:cap(sr.d.chunk)]
+	sr.dataPool.Put(sr.d)
 	sr.ad = nil
 	sr.closed = true
 	return nil
@@ -397,18 +389,18 @@ func (sr *STREAMReader) WriteTo(w io.Writer) (int64, error) {
 	}
 
 	written := int64(0)
-	for chunk := 0; sr.nonce[0] != 1; chunk++ {
-		if _, err := io.ReadFull(sr.r, sr.nonce); err != nil {
+	for chunk := 0; sr.d.nonce[0] != 1; chunk++ {
+		if _, err := io.ReadFull(sr.r, sr.d.nonce); err != nil {
 			return written, fmt.Errorf("could not read nonce: %w", err)
 		}
 		if chunk != sr.getCounter() {
 			return written, ErrModifiedStream
 		}
-		n, err := io.ReadFull(sr.r, sr.chunk)
-		if sr.nonce[0] != 1 && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) {
+		n, err := io.ReadFull(sr.r, sr.d.chunk)
+		if sr.d.nonce[0] != 1 && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) {
 			return written, ErrTruncatedStream
 		}
-		out, err := sr.aead.Open(sr.chunk[:0], sr.nonce, sr.chunk[:n], sr.ad)
+		out, err := sr.aead.Open(sr.d.chunk[:0], sr.d.nonce, sr.d.chunk[:n], sr.ad)
 		if err != nil {
 			return written, fmt.Errorf("decryption failed: %w", err)
 		}
@@ -426,5 +418,5 @@ func (sr *STREAMReader) WriteTo(w io.Writer) (int64, error) {
 
 // getCounter returns the counter part of the header as an integer.
 func (sr *STREAMReader) getCounter() int {
-	return int(sr.nonce[1]) ^ (int(sr.nonce[2]) << 8) ^ (int(sr.nonce[3]) << 16)
+	return int(sr.d.nonce[1]) ^ (int(sr.d.nonce[2]) << 8) ^ (int(sr.d.nonce[3]) << 16)
 }
