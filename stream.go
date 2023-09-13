@@ -221,16 +221,18 @@ func (sw *STREAMWriter) ReadFrom(r io.Reader) (int64, error) {
 
 	read := int64(0)
 	for sw.d.nonce[0] != 1 {
-		n, err := io.ReadFull(r, sw.d.chunk[:ChunkSize])
+		n, readErr := io.ReadFull(r, sw.d.chunk[:ChunkSize])
 		read += int64(n)
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			// This is the last chunk
+		if readErr != nil {
+			// No matter which error occurs (i.e. it could be an expected EOF) we cannot read
+			// any more data, so we mark this as the last chunk.
 			sw.d.nonce[0] = 1
-		} else if err != nil {
-			return read, fmt.Errorf("could not read chunk: %w", err)
 		}
 		if err := sw.writeChunk(sw.d.chunk[:n]); err != nil {
 			return read, err
+		}
+		if readErr != nil && !errors.Is(readErr, io.EOF) && !errors.Is(readErr, io.ErrUnexpectedEOF) {
+			return read, fmt.Errorf("could not read chunk: %w", readErr)
 		}
 	}
 

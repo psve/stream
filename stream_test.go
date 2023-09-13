@@ -116,6 +116,55 @@ func TestOverhead(t *testing.T) {
 	}
 }
 
+type testErrReader struct {
+	io.Reader
+	limit int
+	read  int
+}
+
+func (r *testErrReader) Read(b []byte) (int, error) {
+	if r.read+len(b) > r.limit {
+		canRead := r.limit - r.read
+		n, _ := r.Reader.Read(b[:canRead])
+		r.read += n
+		return n, errors.New("test error")
+	}
+	n, err := r.Reader.Read(b)
+	r.read += n
+	return n, err
+}
+
+func TestErroredStream(t *testing.T) {
+	stream := setupSTREAM()
+	plaintext := randomData(3*ChunkSize + 1024)
+	additionalData := randomData(1024)
+
+	// errPlaintext will error before reading the whole plaintext. We should still be able
+	// to decrypt what was read.
+	errPlaintext := &testErrReader{
+		Reader: bytes.NewReader(plaintext),
+		limit:  3*ChunkSize - 1024,
+	}
+
+	ciphertext := new(bytes.Buffer)
+	w := must(stream.NewWriter(ciphertext, additionalData))
+	n, err := w.ReadFrom(errPlaintext)
+	if err == nil {
+		t.Fatalf("expected ReadFrom to error")
+	}
+	if n != int64(errPlaintext.limit) {
+		t.Fatalf("wrong number of bytes read")
+	}
+
+	decrypted := new(bytes.Buffer)
+	if err := stream.Open(decrypted, ciphertext, additionalData); err != nil {
+		t.Fatalf("decryption failed: %s", err)
+	}
+	if !bytes.Equal(decrypted.Bytes(), plaintext[:errPlaintext.limit]) {
+		t.Fatal("wrong decryption result")
+	}
+}
+
 func TestSwapChunksOpen(t *testing.T) {
 	stream := setupSTREAM()
 	plaintext := io.LimitReader(rand.Reader, 3*ChunkSize)
