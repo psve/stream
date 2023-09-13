@@ -166,43 +166,43 @@ func (sw *STREAMWriter) Write(p []byte) (int, error) {
 		return 0, ErrWriteAfterClose
 	}
 
-	for idx := 0; idx < len(p); {
+	inLen := len(p)
+	for len(p) > 0 {
 		switch {
-		case len(sw.d.chunk) == 0 && len(p[idx:]) >= ChunkSize:
+		case len(sw.d.chunk) == 0 && len(p) >= ChunkSize:
 			// If there's nothing in our buffer, and we could buffer an entire chunk, just use
 			// p as input directly.
 			if _, err := sw.w.Write(sw.d.nonce); err != nil {
-				return idx, fmt.Errorf("could not write nonce: %w", err)
+				return inLen - len(p), fmt.Errorf("could not write nonce: %w", err)
 			}
-			if _, err := sw.w.Write(sw.aead.Seal(sw.d.chunk[:0], sw.d.nonce, p[idx:idx+ChunkSize], sw.ad)); err != nil {
-				return idx, fmt.Errorf("could not write chunk: %w", err)
+			if _, err := sw.w.Write(sw.aead.Seal(sw.d.chunk[:0], sw.d.nonce, p[:ChunkSize], sw.ad)); err != nil {
+				return inLen - len(p), fmt.Errorf("could not write chunk: %w", err)
 			}
 
+			p = p[ChunkSize:]
 			sw.ad, sw.d.chunk = nil, sw.d.chunk[:0]
 			sw.increaseCounter()
-			idx += ChunkSize
 		case len(sw.d.chunk) < ChunkSize:
 			// If we don't have a full chunk buffer yet, buffer as much as possible. Note that
 			// the buffer always has capacity ChunkSize, so this doesn't allocate.
-			canBuffer := min(len(p)-idx, ChunkSize-len(sw.d.chunk))
-			sw.d.chunk = append(sw.d.chunk, p[idx:idx+canBuffer]...)
-			idx += canBuffer
+			canBuffer := min(len(p), ChunkSize-len(sw.d.chunk))
+			sw.d.chunk = append(sw.d.chunk, p[:canBuffer]...)
+			p = p[canBuffer:]
 		case len(sw.d.chunk) == ChunkSize:
 			// We have filled up our plaintext buffer, write the next chunk.
 			if _, err := sw.w.Write(sw.d.nonce); err != nil {
-				return idx, fmt.Errorf("could not write nonce: %w", err)
+				return inLen - len(p), fmt.Errorf("could not write nonce: %w", err)
 			}
 			if _, err := sw.w.Write(sw.aead.Seal(sw.d.chunk[:0], sw.d.nonce, sw.d.chunk, sw.ad)); err != nil {
-				return idx, fmt.Errorf("could not write chunk: %w", err)
+				return inLen - len(p), fmt.Errorf("could not write chunk: %w", err)
 			}
 
 			sw.ad, sw.d.chunk = nil, sw.d.chunk[:0]
 			sw.increaseCounter()
-			idx += ChunkSize
 		}
 	}
 
-	return len(p), nil
+	return inLen, nil
 }
 
 // Close flushes all data to the underlying io.Writer and closes the stream. Subsequent
@@ -305,38 +305,38 @@ func (sr *STREAMReader) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 
-	out, inplace := sr.d.chunk, false
+	inLen, out, inplace := len(p), sr.d.chunk, false
 
-	for idx := 0; idx < len(p); {
+	for len(p) > 0 {
 		switch {
 		case sr.d.nonce[0] == 1 && sr.chunkIdx == len(out):
 			// We have read the last chunk and used the entire plaintext buffer. There's
 			// nothing left to do.
-			return idx, io.EOF
+			return inLen - len(p), io.EOF
 		case inplace && sr.chunkIdx < ChunkSize:
 			// We just did an inplace operation, just update the indices.
-			idx += len(out)
+			p = p[len(out):]
 			sr.chunkIdx += len(out)
 		case sr.chunkIdx < ChunkSize:
 			// We still have plaintext available in the buffer. Copy as many bytes as
 			// possible.
-			copied := copy(p[idx:], out[sr.chunkIdx:])
-			idx += copied
+			copied := copy(p, out[sr.chunkIdx:])
+			p = p[copied:]
 			sr.chunkIdx += copied
 		case sr.chunkIdx == ChunkSize:
 			// We havn't read the last chunk yet, but we have run out of plaintext buffer. Try
 			// to read the next chunk.
 			if _, err := io.ReadFull(sr.r, sr.d.nonce); err != nil {
-				return idx, fmt.Errorf("could not read nonce: %w", err)
+				return inLen - len(p), fmt.Errorf("could not read nonce: %w", err)
 			}
 			if sr.chunkCount != sr.getCounter() {
-				return idx, ErrModifiedStream
+				return inLen - len(p), ErrModifiedStream
 			}
 
 			// If p has enough capacity we can read directly to that instead of staging
 			// through the buffer.
-			if cap(p[idx:]) >= ChunkSize+sr.aead.Overhead() {
-				out, inplace = p[idx:], true
+			if cap(p) >= ChunkSize+sr.aead.Overhead() {
+				out, inplace = p, true
 			} else {
 				out, inplace = sr.d.chunk, false
 				defer func() { sr.d.chunk = out }()
@@ -351,11 +351,11 @@ func (sr *STREAMReader) Read(p []byte) (int, error) {
 
 			n, err := io.ReadFull(sr.r, out)
 			if sr.d.nonce[0] != 1 && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) {
-				return idx, ErrTruncatedStream
+				return inLen - len(p), ErrTruncatedStream
 			}
 			out, err = sr.aead.Open(out[:0], sr.d.nonce, out[:n], sr.ad)
 			if err != nil {
-				return idx, fmt.Errorf("decryption failed: %w", err)
+				return inLen - len(p), fmt.Errorf("decryption failed: %w", err)
 			}
 
 			sr.ad, sr.chunkIdx = nil, 0
@@ -363,7 +363,7 @@ func (sr *STREAMReader) Read(p []byte) (int, error) {
 		}
 	}
 
-	return len(p), nil
+	return inLen, nil
 }
 
 // Close frees underlying resources used by the STREAMReader. Subsequent calls to Close
