@@ -300,22 +300,17 @@ func (sr *STREAMReader) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 
-	inLen, out, inplace := len(p), sr.d.chunk, false
-
+	inLen := len(p)
 	for len(p) > 0 {
 		switch {
-		case sr.d.nonce[0] == 1 && sr.chunkIdx == len(out):
+		case sr.d.nonce[0] == 1 && sr.chunkIdx == len(sr.d.chunk):
 			// We have read the last chunk and used the entire plaintext buffer. There's
 			// nothing left to do.
 			return inLen - len(p), io.EOF
-		case inplace && sr.chunkIdx < ChunkSize:
-			// We just did an inplace operation, just update the indices.
-			p = p[len(out):]
-			sr.chunkIdx += len(out)
 		case sr.chunkIdx < ChunkSize:
 			// We still have plaintext available in the buffer. Copy as many bytes as
 			// possible.
-			copied := copy(p, out[sr.chunkIdx:])
+			copied := copy(p, sr.d.chunk[sr.chunkIdx:])
 			p = p[copied:]
 			sr.chunkIdx += copied
 		case sr.chunkIdx == ChunkSize:
@@ -328,27 +323,15 @@ func (sr *STREAMReader) Read(p []byte) (int, error) {
 				return inLen - len(p), ErrModifiedStream
 			}
 
-			// If p has enough capacity we can read directly to that instead of staging
-			// through the buffer.
-			if cap(p) >= ChunkSize+sr.aead.Overhead() {
-				out, inplace = p, true
-			} else {
-				out, inplace = sr.d.chunk, false
-				defer func() { sr.d.chunk = out }()
-			}
-
 			// Growing the slice here to make room for the ciphertext chunk doesn't require
-			// allocation:
-			// - sr.d.chunk always has capacity ChunkSize+sr.aead.Overhead().
-			// - In case of an inplace operation the check above ensures that p has enough
-			//   capacity.
-			out = out[:ChunkSize+sr.aead.Overhead()]
+			// allocation as sr.d.chunk always has capacity ChunkSize+sr.aead.Overhead().
+			sr.d.chunk = sr.d.chunk[:ChunkSize+sr.aead.Overhead()]
 
-			n, err := io.ReadFull(sr.r, out)
+			n, err := io.ReadFull(sr.r, sr.d.chunk)
 			if sr.d.nonce[0] != 1 && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) {
 				return inLen - len(p), ErrTruncatedStream
 			}
-			out, err = sr.aead.Open(out[:0], sr.d.nonce, out[:n], sr.ad)
+			sr.d.chunk, err = sr.aead.Open(sr.d.chunk[:0], sr.d.nonce, sr.d.chunk[:n], sr.ad)
 			if err != nil {
 				return inLen - len(p), fmt.Errorf("decryption failed: %w", err)
 			}
