@@ -172,16 +172,10 @@ func (sw *STREAMWriter) Write(p []byte) (int, error) {
 		case len(sw.d.chunk) == 0 && len(p) >= ChunkSize:
 			// If there's nothing in our buffer, and we could buffer an entire chunk, just use
 			// p as input directly.
-			if _, err := sw.w.Write(sw.d.nonce); err != nil {
-				return inLen - len(p), fmt.Errorf("could not write nonce: %w", err)
+			if err := sw.writeChunk(p[:ChunkSize]); err != nil {
+				return inLen - len(p), err
 			}
-			if _, err := sw.w.Write(sw.aead.Seal(sw.d.chunk[:0], sw.d.nonce, p[:ChunkSize], sw.ad)); err != nil {
-				return inLen - len(p), fmt.Errorf("could not write chunk: %w", err)
-			}
-
 			p = p[ChunkSize:]
-			sw.ad, sw.d.chunk = nil, sw.d.chunk[:0]
-			sw.increaseCounter()
 		case len(sw.d.chunk) < ChunkSize:
 			// If we don't have a full chunk buffer yet, buffer as much as possible. Note that
 			// the buffer always has capacity ChunkSize, so this doesn't allocate.
@@ -190,15 +184,9 @@ func (sw *STREAMWriter) Write(p []byte) (int, error) {
 			p = p[canBuffer:]
 		case len(sw.d.chunk) == ChunkSize:
 			// We have filled up our plaintext buffer, write the next chunk.
-			if _, err := sw.w.Write(sw.d.nonce); err != nil {
-				return inLen - len(p), fmt.Errorf("could not write nonce: %w", err)
+			if err := sw.writeChunk(sw.d.chunk); err != nil {
+				return inLen - len(p), err
 			}
-			if _, err := sw.w.Write(sw.aead.Seal(sw.d.chunk[:0], sw.d.nonce, sw.d.chunk, sw.ad)); err != nil {
-				return inLen - len(p), fmt.Errorf("could not write chunk: %w", err)
-			}
-
-			sw.ad, sw.d.chunk = nil, sw.d.chunk[:0]
-			sw.increaseCounter()
 		}
 	}
 
@@ -214,16 +202,12 @@ func (sw *STREAMWriter) Close() error {
 
 	// Indicate that this is the last chunk and write it.
 	sw.d.nonce[0] = 1
-	if _, err := sw.w.Write(sw.d.nonce); err != nil {
-		return fmt.Errorf("could not write nonce: %w", err)
-	}
-	if _, err := sw.w.Write(sw.aead.Seal(sw.d.chunk[:0], sw.d.nonce, sw.d.chunk, sw.ad)); err != nil {
-		return fmt.Errorf("could not write chunk: %w", err)
+	if err := sw.writeChunk(sw.d.chunk); err != nil {
+		return err
 	}
 
 	clear(sw.d.nonce[:counterOverhead])
 	sw.dataPool.Put(sw.d)
-	sw.ad = nil
 	sw.closed = true
 	return nil
 }
@@ -236,7 +220,7 @@ func (sw *STREAMWriter) ReadFrom(r io.Reader) (int64, error) {
 	}
 
 	read := int64(0)
-	for ; sw.d.nonce[0] != 1; sw.increaseCounter() {
+	for sw.d.nonce[0] != 1 {
 		n, err := io.ReadFull(r, sw.d.chunk[:ChunkSize])
 		read += int64(n)
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
@@ -245,19 +229,30 @@ func (sw *STREAMWriter) ReadFrom(r io.Reader) (int64, error) {
 		} else if err != nil {
 			return read, fmt.Errorf("could not read chunk: %w", err)
 		}
-		if _, err := sw.w.Write(sw.d.nonce); err != nil {
-			return read, fmt.Errorf("could not write nonce: %w", err)
+		if err := sw.writeChunk(sw.d.chunk[:n]); err != nil {
+			return read, err
 		}
-		if _, err := sw.w.Write(sw.aead.Seal(sw.d.chunk[:0], sw.d.nonce, sw.d.chunk[:n], sw.ad)); err != nil {
-			return read, fmt.Errorf("could not write chunk: %w", err)
-		}
-		sw.ad = nil
 	}
 
 	clear(sw.d.nonce[:counterOverhead])
 	sw.dataPool.Put(sw.d)
 	sw.closed = true
 	return read, nil
+}
+
+// writeChunk writes the current nonce and the encrypted chunk to the underlying writer,
+// and prepares for the next chunk.
+func (sw *STREAMWriter) writeChunk(chunk []byte) error {
+	if _, err := sw.w.Write(sw.d.nonce); err != nil {
+		return fmt.Errorf("could not write nonce: %w", err)
+	}
+	if _, err := sw.w.Write(sw.aead.Seal(sw.d.chunk[:0], sw.d.nonce, chunk, sw.ad)); err != nil {
+		return fmt.Errorf("could not write chunk: %w", err)
+	}
+
+	sw.ad, sw.d.chunk = nil, sw.d.chunk[:0]
+	sw.increaseCounter()
+	return nil
 }
 
 // increaseCounter increments the counter part of the header.
