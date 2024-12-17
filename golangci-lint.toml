@@ -17,7 +17,6 @@ enable = [
   "errchkjson",
   "errname",
   "errorlint",
-  "execinquery",
   "exhaustive",
   "exportloopref",
   "forbidigo",
@@ -31,7 +30,7 @@ enable = [
   "gocritic",
   "godot",
   "godox",
-  "goerr113",
+  "err113",
   "gofmt",
   "gofumpt",
   "goheader",
@@ -92,7 +91,7 @@ enable = [
 [[issues.exclude-rules]]
 path = "_test\\.go"
 linters = [
-  "goerr113",
+  "err113",
   "ireturn",
   "wrapcheck",
 ]
