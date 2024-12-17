@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"io"
+	"slices"
 	"testing"
 )
 
@@ -175,11 +176,9 @@ func TestSwapChunksOpen(t *testing.T) {
 
 	// Switch two chunks
 	encryptedChunkSize := stream.aead.NonceSize() + ChunkSize + stream.aead.Overhead()
-	chunkZero := make([]byte, encryptedChunkSize)
-	chunkOne := make([]byte, encryptedChunkSize)
 	buf := ciphertext.Bytes()
-	copy(chunkZero, buf[:encryptedChunkSize])
-	copy(chunkOne, buf[encryptedChunkSize:2*encryptedChunkSize])
+	chunkZero := slices.Clone(buf[:encryptedChunkSize])
+	chunkOne := slices.Clone(buf[encryptedChunkSize : 2*encryptedChunkSize])
 	copy(buf, chunkOne)
 	copy(buf[encryptedChunkSize:], chunkZero)
 
@@ -198,11 +197,9 @@ func TestSwapChunksRead(t *testing.T) {
 
 	// Switch two chunks
 	encryptedChunkSize := stream.aead.NonceSize() + ChunkSize + stream.aead.Overhead()
-	chunkZero := make([]byte, encryptedChunkSize)
-	chunkOne := make([]byte, encryptedChunkSize)
 	buf := ciphertext.Bytes()
-	copy(chunkZero, buf[:encryptedChunkSize])
-	copy(chunkOne, buf[encryptedChunkSize:2*encryptedChunkSize])
+	chunkZero := slices.Clone(buf[:encryptedChunkSize])
+	chunkOne := slices.Clone(buf[encryptedChunkSize : 2*encryptedChunkSize])
 	copy(buf, chunkOne)
 	copy(buf[encryptedChunkSize:], chunkZero)
 
@@ -589,6 +586,53 @@ func TestReadOversizedSlice(t *testing.T) {
 	}
 }
 
+// Test the case where STREAMReader.Read was used to consume part of the last chunk, and
+// STREAMReader.WriteTo is then used to consume the rest.
+func TestReaderReadBeforeWriteTo(t *testing.T) {
+	cases := []int{ChunkSize - 1024, 3 * ChunkSize, 3*ChunkSize + 1024}
+
+	for i, c := range cases {
+		stream := setupSTREAM()
+		additionalData := randomData(1024)
+		plaintext := randomData(c)
+		ciphertext := new(bytes.Buffer)
+		err := stream.Seal(ciphertext, bytes.NewBuffer(plaintext), additionalData)
+		if err != nil {
+			t.Fatalf("(%d) encryption failed: %v", i, err)
+		}
+
+		decrypted := make([]byte, 1024)
+		r := stream.NewReader(ciphertext, additionalData)
+
+		// Consume 1024 bytes of the first chunk using Read.
+		n, err := r.Read(decrypted)
+		if err != nil {
+			t.Fatalf("(%d) decryption failed: %s", i, err)
+		}
+		if n != len(decrypted) {
+			t.Fatalf("(%d) short read: %d < %d", i, n, len(plaintext))
+		}
+
+		// Consume the rest using WriteTo.
+		buf := new(bytes.Buffer)
+		written, err := r.WriteTo(buf)
+		if err != nil {
+			t.Fatalf("(%d) decryption failed: %s", i, err)
+		}
+		if written != int64(c-len(decrypted)) {
+			t.Fatalf("(%d) short read: %d < %d", i, n, len(plaintext))
+		}
+		decrypted = append(decrypted, buf.Bytes()...) //nolint:makezero
+
+		if err := r.Close(); err != nil {
+			t.Fatalf("(%d) close failed: %v", i, err)
+		}
+		if !bytes.Equal(plaintext, decrypted) {
+			t.Fatalf("(%d) wrong decryption result", i)
+		}
+	}
+}
+
 func TestReaderErr(t *testing.T) {
 	stream := setupSTREAM()
 	additionalData := randomData(1024)
@@ -715,7 +759,7 @@ func BenchmarkReader(b *testing.B) {
 	ciphertext := new(bytes.Buffer)
 	sr := must(stream.NewWriter(ciphertext, nil))
 	_, _ = sr.Write(plaintext)
-	_ = sr.Close()
+	sr.Close()
 
 	buf := make([]byte, len(plaintext))
 

@@ -320,28 +320,9 @@ func (sr *STREAMReader) Read(p []byte) (int, error) {
 		case sr.chunkIdx == ChunkSize:
 			// We havn't read the last chunk yet, but we have run out of plaintext buffer. Try
 			// to read the next chunk.
-			if _, err := io.ReadFull(sr.r, sr.d.nonce); err != nil {
-				return inLen - len(p), fmt.Errorf("could not read nonce: %w", err)
+			if err := sr.readChunk(); err != nil {
+				return inLen - len(p), err
 			}
-			if sr.chunkCount != sr.getCounter() {
-				return inLen - len(p), ErrModifiedStream
-			}
-
-			// Growing the slice here to make room for the ciphertext chunk doesn't require
-			// allocation as sr.d.chunk always has capacity ChunkSize+sr.aead.Overhead().
-			sr.d.chunk = sr.d.chunk[:ChunkSize+sr.aead.Overhead()]
-
-			n, err := io.ReadFull(sr.r, sr.d.chunk)
-			if sr.d.nonce[0] != 1 && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) {
-				return inLen - len(p), ErrTruncatedStream
-			}
-			sr.d.chunk, err = sr.aead.Open(sr.d.chunk[:0], sr.d.nonce, sr.d.chunk[:n], sr.ad)
-			if err != nil {
-				return inLen - len(p), fmt.Errorf("decryption failed: %w", err)
-			}
-
-			sr.ad, sr.chunkIdx = nil, 0
-			sr.chunkCount++
 		}
 	}
 
@@ -363,7 +344,7 @@ func (sr *STREAMReader) Close() error {
 	return nil
 }
 
-// ReadFrom will consume all data from the underlying io.Reader and write the decrypted
+// WriteTo will consume all data from the underlying io.Reader and write the decrypted
 // result to w.
 func (sr *STREAMReader) WriteTo(w io.Writer) (int64, error) {
 	if sr.closed {
@@ -371,31 +352,61 @@ func (sr *STREAMReader) WriteTo(w io.Writer) (int64, error) {
 	}
 
 	written := int64(0)
-	for chunk := 0; sr.d.nonce[0] != 1; chunk++ {
-		if _, err := io.ReadFull(sr.r, sr.d.nonce); err != nil {
-			return written, fmt.Errorf("could not read nonce: %w", err)
-		}
-		if chunk != sr.getCounter() {
-			return written, ErrModifiedStream
-		}
-		n, err := io.ReadFull(sr.r, sr.d.chunk)
-		if sr.d.nonce[0] != 1 && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) {
-			return written, ErrTruncatedStream
-		}
-		out, err := sr.aead.Open(sr.d.chunk[:0], sr.d.nonce, sr.d.chunk[:n], sr.ad)
-		if err != nil {
-			return written, fmt.Errorf("decryption failed: %w", err)
-		}
-		n, err = w.Write(out)
+
+	if sr.chunkIdx < ChunkSize {
+		// STREAMReader.Read was called at some point and we still have plaintext available
+		// in the buffer. Write the rest of the chunk so we can start from a new chunk
+		// below.
+		n, err := w.Write(sr.d.chunk[sr.chunkIdx:])
 		written += int64(n)
 		if err != nil {
 			return written, fmt.Errorf("could not write chunk: %w", err)
 		}
-		sr.ad = nil
+		sr.chunkIdx += n
+	}
+
+	for sr.d.nonce[0] != 1 {
+		if err := sr.readChunk(); err != nil {
+			return written, err
+		}
+
+		n, err := w.Write(sr.d.chunk)
+		written += int64(n)
+		if err != nil {
+			return written, fmt.Errorf("could not write chunk: %w", err)
+		}
 	}
 
 	sr.Close()
 	return written, nil
+}
+
+// readChunk reads the next chunk from the underlying io.Reader. It is assumed that
+// we're at the start of a new chunk.
+func (sr *STREAMReader) readChunk() error {
+	if _, err := io.ReadFull(sr.r, sr.d.nonce); err != nil {
+		return fmt.Errorf("could not read nonce: %w", err)
+	}
+	if sr.chunkCount != sr.getCounter() {
+		return ErrModifiedStream
+	}
+
+	// Growing the slice here to make room for the ciphertext chunk. This doesn't require
+	// allocation as sr.d.chunk always has capacity ChunkSize+sr.aead.Overhead().
+	sr.d.chunk = sr.d.chunk[:ChunkSize+sr.aead.Overhead()]
+
+	n, err := io.ReadFull(sr.r, sr.d.chunk)
+	if sr.d.nonce[0] != 1 && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) {
+		return ErrTruncatedStream
+	}
+	sr.d.chunk, err = sr.aead.Open(sr.d.chunk[:0], sr.d.nonce, sr.d.chunk[:n], sr.ad)
+	if err != nil {
+		return fmt.Errorf("decryption failed: %w", err)
+	}
+
+	sr.ad, sr.chunkIdx = nil, 0
+	sr.chunkCount++
+	return nil
 }
 
 // getCounter returns the counter part of the header as an integer.
